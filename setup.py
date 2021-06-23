@@ -408,6 +408,9 @@ papermill = [
     'papermill[all]>=1.2.1',
     'scrapbook[all]',
 ]
+paramiko = [
+    'paramiko>=2.7.2',
+]
 password = [
     'bcrypt>=2.0.0',
     'flask-bcrypt>=0.7.1',
