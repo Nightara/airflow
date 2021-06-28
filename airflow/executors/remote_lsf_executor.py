@@ -1,7 +1,10 @@
 import os
+import re
+import time
 from typing import Optional, Any
 from urllib.parse import urlparse
 
+from airflow.configuration import conf
 from airflow.executors.base_executor import BaseExecutor, CommandType
 from airflow.models.taskinstance import TaskInstanceKey
 from paramiko.rsakey import RSAKey
@@ -10,11 +13,19 @@ from paramiko import SSHClient
 
 class RemoteLsfExecutor(BaseExecutor):
 
-    def __init__(self, *args, remote: str, user: str, key_file: str, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.remote = urlparse(remote)
-        self.user = user
-        self.key_file = key_file
+        self.remote = None
+        self.user = None
+        self.key_file = None
+        self.bjob_to_task = None
+        self.task_to_bjob = None
+
+    def start(self):
+        """Load configuration from config files."""
+        self.remote = urlparse(conf.get("lsf", "remote"))
+        self.user = conf.get("lsf", "user")
+        self.key_file = conf.get("lsf", "key_file")
         self.bjob_to_task = dict()
         self.task_to_bjob = dict()
 
@@ -31,16 +42,12 @@ class RemoteLsfExecutor(BaseExecutor):
         if not success:
             raise ValueError("Invalid SSH configuration.")
 
-    def start(self):
-        """Executors may need to get things started."""
-        # TODO: Depending on terminate() implementation: Load all running jobs?
-        raise NotImplementedError()
-
-    def sync(self) -> None:
+    def sync(self) -> int:
         """
         Sync will get called periodically by the heartbeat method.
         Executors should override this to perform gather statuses.
         """
+        running_jobs = 0
         with self.connector as connection:
             _, stdout, stderr = connection.exec_command("source /etc/profile.d/lsf.sh && bjobs -aW")
             for bjob in [RemoteLsfExecutor._parse_bjob(line) for line in stdout if line[0].isdigit()]:
@@ -51,8 +58,8 @@ class RemoteLsfExecutor(BaseExecutor):
                     elif bjob.failed:
                         self.fail(task_id)
                     else:
-                        # TODO: Handle running / pending states.
-                        pass
+                        running_jobs += 1
+        return running_jobs
 
     def execute_async(self, key: TaskInstanceKey, command: CommandType, queue: Optional[str] = None,
                       executor_config: Optional[Any] = None) -> None:
@@ -65,28 +72,45 @@ class RemoteLsfExecutor(BaseExecutor):
         :param executor_config: Configuration passed to the executor.
         """
         with self.connector as connection:
-            # TODO: Submit, register LSF job ID in bjob_to_task and task_to_bjob
-            pass
-        raise NotImplementedError()
+            # TODO: Determine RAM, cores, job name, job command
+            # TODO: Can queue be used for lsf_queue?
+            lsf_mem = 1
+            lsf_cores = 1
+            lsf_queue = "short"
+            lsf_name = "Test"
+            lsf_command = "ls -la"
 
-    def end(self) -> None:
+            bsub = "bsub -R rusage[mem=%dG] -n %d -q %s -J '%s' %s" % (lsf_mem, lsf_cores, lsf_queue, lsf_name,
+                                                                       lsf_command)
+            _, stdout, stderr = connection.exec_command("source /etc/profile.d/lsf.sh && " + bsub)
+            for line in stdout:
+                match = re.match("^Job <(.*)> is submitted to queue <%s>.$" % queue, line)
+                if match:
+                    self.bjob_to_task[match.group(1)] = key
+                    self.task_to_bjob[key] = match.group(1)
+
+    def end(self, heartbeat_interval=10) -> None:
         """
         This method is called when the caller is done submitting job and
-        wants to wait synchronously for the job submitted previously to be
-        all done.
+        wants to wait synchronously for the jobs submitted previously to be
+        all done. Using this method is not recommended.
         """
-        # TODO: How should this be handled? Wait for all jobs? Wait for one job?
-        raise NotImplementedError()
+        while not self.sync():
+            time.sleep(heartbeat_interval)
 
     def terminate(self):
         """This method is called when the daemon receives a SIGTERM"""
-        # TODO: How should this be handled? Kill jobs? Let them run?
-        raise NotImplementedError()
+        with self.connector as connection:
+            _, stdout, stderr = connection.exec_command("source /etc/profile.d/lsf.sh && bjobs -aW")
+            for bjob in [RemoteLsfExecutor._parse_bjob(line) for line in stdout if line[0].isdigit()]:
+                if bjob.running and bjob.lsf_id in self.bjob_to_task:
+                    connection.exec_command("source /etc/profile.d/lsf.sh && bkill " + bjob.lsf_id)
+                    self.fail(self.bjob_to_task[bjob.lsf_id])
 
     @staticmethod
     def _parse_bjob(line: str):
         data = line.split()
-        return LsfTask(int(data[0]), data[6], data[2] == "RUN", data[2] == "DONE", data[2] == "EXIT")
+        return LsfTask(data[0], data[6], data[2] == "RUN", data[2] == "DONE", data[2] == "EXIT")
 
 
 class SshConnector:
@@ -110,7 +134,7 @@ class SshConnector:
 
 class LsfTask:
 
-    def __init__(self, lsf_id: int, lsf_name: str, running: bool, finished: bool, failed: bool):
+    def __init__(self, lsf_id: str, lsf_name: str, running: bool, finished: bool, failed: bool):
         self.lsf_id = lsf_id
         self.lsf_name = lsf_name
         self.running = running
