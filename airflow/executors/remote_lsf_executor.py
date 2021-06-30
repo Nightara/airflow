@@ -4,27 +4,31 @@ import time
 from typing import Optional, Any
 from urllib.parse import urlparse
 
-from airflow.configuration import conf
+from airflow.configuration import conf, log
 from airflow.executors.base_executor import BaseExecutor, CommandType
 from airflow.models.taskinstance import TaskInstanceKey
 from paramiko.rsakey import RSAKey
 from paramiko import SSHClient
+
+from airflow.utils.state import State
 
 
 class RemoteLsfExecutor(BaseExecutor):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.remote = None
         self.user = None
+        self.remote = None
         self.key_file = None
+        self.connector = None
+        self.private_key = None
         self.bjob_to_task = None
         self.task_to_bjob = None
 
     def start(self):
         """Load configuration from config files."""
-        self.remote = urlparse(conf.get("lsf", "remote"))
         self.user = conf.get("lsf", "user")
+        self.remote = urlparse(conf.get("lsf", "remote"))
         self.key_file = conf.get("lsf", "key_file")
         self.bjob_to_task = dict()
         self.task_to_bjob = dict()
@@ -35,31 +39,36 @@ class RemoteLsfExecutor(BaseExecutor):
         ssh_client.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
         with open(self.key_file) as f:
             self.private_key = RSAKey.from_private_key(f)
-            self.connector = SshConnector(ssh_client, self.remote.geturl(), self.user, RSAKey.from_private_key(f))
+            self.connector = SshConnector(ssh_client, self.remote.geturl(), self.user, self.private_key)
             with self.connector:
                 success = self.connector.exception is None
 
         if not success:
             raise ValueError("Invalid SSH configuration.")
 
-    def sync(self) -> int:
+    def sync(self) -> None:
         """
         Sync will get called periodically by the heartbeat method.
         Executors should override this to perform gather statuses.
         """
-        running_jobs = 0
         with self.connector as connection:
             _, stdout, stderr = connection.exec_command("source /etc/profile.d/lsf.sh && bjobs -aW")
             for bjob in [RemoteLsfExecutor._parse_bjob(line) for line in stdout if line[0].isdigit()]:
                 if bjob.lsf_id in self.bjob_to_task:
                     task_id = self.bjob_to_task[bjob.lsf_id]
                     if bjob.finished:
+                        del self.task_to_bjob[task_id]
+                        del self.bjob_to_task[bjob.lsf_id]
                         self.success(task_id)
                     elif bjob.failed:
+                        del self.task_to_bjob[task_id]
+                        del self.bjob_to_task[bjob.lsf_id]
                         self.fail(task_id)
+                    elif bjob.running:
+                        # TODO: Why is this not propagated?
+                        self.change_state(task_id, State.RUNNING)
                     else:
-                        running_jobs += 1
-        return running_jobs
+                        self.change_state(task_id, State.QUEUED, bjob.lsf_id)
 
     def execute_async(self, key: TaskInstanceKey, command: CommandType, queue: Optional[str] = None,
                       executor_config: Optional[Any] = None) -> None:
@@ -78,24 +87,37 @@ class RemoteLsfExecutor(BaseExecutor):
             lsf_cores = 1
             lsf_queue = "short"
             lsf_name = "Test"
-            lsf_command = "ls -la"
+            lsf_command = "sleep 20"
+            log.info(command)
+            log.info(queue)
+            log.info(executor_config)
 
             bsub = "bsub -R rusage[mem=%dG] -n %d -q %s -J '%s' %s" % (lsf_mem, lsf_cores, lsf_queue, lsf_name,
                                                                        lsf_command)
+            log.info(bsub)
             _, stdout, stderr = connection.exec_command("source /etc/profile.d/lsf.sh && " + bsub)
             for line in stdout:
-                match = re.match("^Job <(.*)> is submitted to queue <%s>.$" % queue, line)
+                log.info(line)
+                match = re.match("^Job <(\\d+)> is submitted to queue <%s>.\\s*$" % lsf_queue, line)
                 if match:
+                    log.info("Submitted with LSF ID " + match.group(1))
                     self.bjob_to_task[match.group(1)] = key
                     self.task_to_bjob[key] = match.group(1)
+                    self.change_state(key, State.QUEUED, match.group(1))
+                    return
+
+            log.error("Submission failed.")
+            self.fail(key)
 
     def end(self, heartbeat_interval=10) -> None:
         """
         This method is called when the caller is done submitting job and
         wants to wait synchronously for the jobs submitted previously to be
-        all done. Using this method is not recommended.
+        all done.
         """
-        while not self.sync():
+        while self.bjob_to_task:
+            self.sync()
+            log.info("Waiting for %d tasks to end." % len(self.bjob_to_task))
             time.sleep(heartbeat_interval)
 
     def terminate(self):
