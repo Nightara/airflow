@@ -24,6 +24,7 @@ class RemoteLsfExecutor(BaseExecutor):
         self.private_key = None
         self.bjob_to_task = None
         self.task_to_bjob = None
+        self.runnings_tasks = None
 
     def start(self):
         """Load configuration from config files."""
@@ -32,19 +33,18 @@ class RemoteLsfExecutor(BaseExecutor):
         self.key_file = conf.get("lsf", "key_file")
         self.bjob_to_task = dict()
         self.task_to_bjob = dict()
+        self.runnings_tasks = dict()
 
+        # TODO: Mock SSH connection
         # Test SSH connection
-        success = False
         ssh_client = SSHClient()
         ssh_client.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
         with open(self.key_file) as f:
             self.private_key = RSAKey.from_private_key(f)
             self.connector = SshConnector(ssh_client, self.remote.geturl(), self.user, self.private_key)
             with self.connector:
-                success = self.connector.exception is None
-
-        if not success:
-            raise ValueError("Invalid SSH configuration.")
+                if self.connector.exception:
+                    raise self.connector.exception
 
     def sync(self) -> None:
         """
@@ -66,9 +66,27 @@ class RemoteLsfExecutor(BaseExecutor):
                         self.fail(task_id)
                     elif bjob.running:
                         # TODO: Why is this not propagated?
+                        log.info(self.runnings_tasks[task_id])
+                        self.runnings_tasks[task_id].check_and_change_state_before_execution()
                         self.change_state(task_id, State.RUNNING)
                     else:
-                        self.change_state(task_id, State.QUEUED, bjob.lsf_id)
+                        # self.change_state(task_id, State.QUEUED, bjob.lsf_id)
+                        pass
+
+    def trigger_tasks(self, open_slots: int) -> None:
+        """
+        Triggers tasks
+
+        :param open_slots: Number of open slots
+        """
+        sorted_queue = self.order_queued_tasks_by_priority()
+
+        for _ in range(min((open_slots, len(self.queued_tasks)))):
+            key, (command, _, queue, ti) = sorted_queue.pop(0)
+            self.queued_tasks.pop(key)
+            self.running.add(key)
+            self.runnings_tasks[key] = ti
+            self.execute_async(key=key, command=command, queue=queue, executor_config=ti.executor_config)
 
     def execute_async(self, key: TaskInstanceKey, command: CommandType, queue: Optional[str] = None,
                       executor_config: Optional[Any] = None) -> None:
