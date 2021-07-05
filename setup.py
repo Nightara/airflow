@@ -593,6 +593,7 @@ PROVIDERS_REQUIREMENTS: Dict[str, List[str]] = {
     'opsgenie': http_provider,
     'oracle': oracle,
     'pagerduty': pagerduty,
+    'paramiko': paramiko,
     'papermill': papermill,
     'plexus': plexus,
     'postgres': postgres,

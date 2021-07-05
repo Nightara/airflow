@@ -33,7 +33,7 @@ class RemoteLsfExecutor(BaseExecutor):
 
     def start(self):
         """Executors may need to get things started."""
-        # TODO: Depending on terminate() implementation: Load all running jobs?
+        # TODO: Setup?
         raise NotImplementedError()
 
     def sync(self) -> None:
@@ -75,12 +75,12 @@ class RemoteLsfExecutor(BaseExecutor):
         wants to wait synchronously for the job submitted previously to be
         all done.
         """
-        # TODO: How should this be handled? Wait for all jobs? Wait for one job?
+        # TODO: Wait for all jobs to finish - call sync in loop.
         raise NotImplementedError()
 
     def terminate(self):
         """This method is called when the daemon receives a SIGTERM"""
-        # TODO: How should this be handled? Kill jobs? Let them run?
+        # TODO: Kill all jobs
         raise NotImplementedError()
 
     @staticmethod
