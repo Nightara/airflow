@@ -11,6 +11,7 @@ from airflow.models.taskinstance import TaskInstanceKey
 from paramiko.rsakey import RSAKey
 from paramiko import SSHClient
 
+from airflow.utils.session import provide_session
 from airflow.utils.state import State
 
 
@@ -56,7 +57,8 @@ class RemoteLsfExecutor(BaseExecutor):
                 if self.connector.exception:
                     raise self.connector.exception
 
-    def sync(self) -> None:
+    @provide_session
+    def sync(self, session=None) -> None:
         """
         Sync will get called periodically by the heartbeat method.
         Executors should override this to perform gather statuses.
@@ -66,22 +68,29 @@ class RemoteLsfExecutor(BaseExecutor):
             for bjob in [RemoteLsfExecutor._parse_bjob(line) for line in stdout if line[0].isdigit()]:
                 if bjob.lsf_id in self.bjob_to_task:
                     task_id = self.bjob_to_task[bjob.lsf_id]
-                    if bjob.finished:
-                        del self.task_to_bjob[task_id]
-                        del self.bjob_to_task[bjob.lsf_id]
-                        self.success(task_id)
-                    elif bjob.failed:
-                        del self.task_to_bjob[task_id]
-                        del self.bjob_to_task[bjob.lsf_id]
-                        self.fail(task_id)
-                    elif bjob.running:
-                        # TODO: Why is this not propagated?
-                        log.info(self.runnings_tasks[task_id])
-                        self.runnings_tasks[task_id].check_and_change_state_before_execution()
-                        self.change_state(task_id, State.RUNNING)
-                    else:
-                        # self.change_state(task_id, State.QUEUED, bjob.lsf_id)
-                        pass
+                    if bjob.running or bjob.finished or bjob.failed:
+                        # Load current task status from database
+                        ti = self.runnings_tasks[task_id]
+                        ti.refresh_from_db(session=session, lock_for_update=True)
+
+                        # Update task status to RUNNING and sync with database
+                        if ti.state == State.QUEUED:
+                            ti.state = State.RUNNING
+                            session.merge(ti)
+                            session.commit()
+                            self.change_state(task_id, State.RUNNING)
+
+                        if bjob.finished:
+                            del self.task_to_bjob[task_id]
+                            del self.bjob_to_task[bjob.lsf_id]
+                            del self.runnings_tasks[task_id]
+                            self.success(task_id)
+                            # TODO: Why are subtasks not called?
+                        elif bjob.failed:
+                            del self.task_to_bjob[task_id]
+                            del self.bjob_to_task[bjob.lsf_id]
+                            del self.runnings_tasks[task_id]
+                            self.fail(task_id)
 
     def trigger_tasks(self, open_slots: int) -> None:
         """
@@ -203,7 +212,7 @@ class MockClient(SSHClient):
         environment: Optional[Dict[str, str]] = ...,
     ) -> Tuple[None, Iterable, Iterable]:
         if "bsub" in command:
-            queue = re.match("-q (\\w+) ", command)
+            queue = re.search("-q (\\w+) ", command)
             if queue:
                 new_id = 0
                 while new_id in self.ids:
@@ -214,9 +223,9 @@ class MockClient(SSHClient):
 
         elif "bjobs" in command:
             data = list()
-            for job_id, job_status in self.ids:
-                if job_status < 4:
-                    data.append("%d a %s c d e Test_Name" % (job_id, self.status_message[job_status]))
+            for job_id in self.ids:
+                if self.ids[job_id] < 4:
+                    data.append("%d a %s c d e Test_Name" % (job_id, self.status_message[self.ids[job_id]]))
                     self.ids[job_id] = max(self.ids[job_id] + 1, 2)
             return None, data, []
 
