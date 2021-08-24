@@ -1,13 +1,16 @@
+import collections
 import os
 import random
 import re
 import time
 from typing import Optional, Any, Dict, Tuple, Iterable
 from urllib.parse import urlparse
+from datetime import datetime, timezone
 
+import airflow.utils.cli
 from airflow.configuration import conf, log
 from airflow.executors.base_executor import BaseExecutor, CommandType
-from airflow.models.taskinstance import TaskInstanceKey
+from airflow.models.taskinstance import TaskInstanceKey, TaskInstance
 from paramiko.rsakey import RSAKey
 from paramiko import SSHClient
 
@@ -76,16 +79,20 @@ class RemoteLsfExecutor(BaseExecutor):
                         # Update task status to RUNNING and sync with database
                         if ti.state == State.QUEUED:
                             ti.state = State.RUNNING
+                            ti.start_date = datetime.now(tz=timezone.utc)
                             session.merge(ti)
                             session.commit()
                             self.change_state(task_id, State.RUNNING)
 
-                        if bjob.finished:
+                        if bjob.finished and ti.state not in [State.SUCCESS, State.FAILED, State.SHUTDOWN]:
                             del self.task_to_bjob[task_id]
                             del self.bjob_to_task[bjob.lsf_id]
                             del self.runnings_tasks[task_id]
-                            self.success(task_id)
-                            # TODO: Why are subtasks not called?
+
+                            ti.state = State.SUCCESS
+                            ti.end_date = datetime.now(tz=timezone.utc)
+                            session.merge(ti)
+                            session.commit()
                         elif bjob.failed:
                             del self.task_to_bjob[task_id]
                             del self.bjob_to_task[bjob.lsf_id]
@@ -107,8 +114,9 @@ class RemoteLsfExecutor(BaseExecutor):
             self.runnings_tasks[key] = ti
             self.execute_async(key=key, command=command, queue=queue, executor_config=ti.executor_config)
 
+    @provide_session
     def execute_async(self, key: TaskInstanceKey, command: CommandType, queue: Optional[str] = None,
-                      executor_config: Optional[Any] = None) -> None:
+                      executor_config: Optional[Any] = None, session=None) -> None:
         """
         This method will execute the command asynchronously.
 
@@ -116,32 +124,29 @@ class RemoteLsfExecutor(BaseExecutor):
         :param command: Command to run
         :param queue: name of the queue
         :param executor_config: Configuration passed to the executor.
+        :param session: SQAlchemy session, provided by the system.
         """
         with self.connector as connection:
-            # TODO: Determine RAM, cores, job name, job command
             # TODO: Can queue be used for lsf_queue?
-            lsf_mem = 1
-            lsf_cores = 1
-            lsf_queue = "short"
-            lsf_name = "Test"
-            lsf_command = "sleep 20"
-            log.info(command)
-            log.info(queue)
-            log.info(executor_config)
+            lsf_data = self._parse_command(command)
+            queue = "short" if queue is None else queue
 
-            bsub = "bsub -R rusage[mem=%dG] -n %d -q %s -J '%s' %s" % (lsf_mem, lsf_cores, lsf_queue, lsf_name,
-                                                                       lsf_command)
-            log.info(bsub)
-            _, stdout, stderr = connection.exec_command("source /etc/profile.d/lsf.sh && " + bsub)
-            for line in stdout:
-                log.info(line)
-                match = re.match("^Job <(\\d+)> is submitted to queue <%s>.\\s*$" % lsf_queue, line)
-                if match:
-                    log.info("Submitted with LSF ID " + match.group(1))
-                    self.bjob_to_task[match.group(1)] = key
-                    self.task_to_bjob[key] = match.group(1)
-                    self.change_state(key, State.QUEUED, match.group(1))
-                    return
+            if lsf_data.valid:
+                bsub = "bsub -R rusage[mem=%dG] -n %d -q %s -J '%s' %s" % (lsf_data.mem, lsf_data.cores, queue,
+                                                                           lsf_data.name, lsf_data.command)
+                log.info(bsub)
+                _, stdout, stderr = connection.exec_command("source /etc/profile.d/lsf.sh && " + bsub)
+                for line in stdout:
+                    log.info(line)
+                    match = re.match("^Job <(\\d+)> is submitted to queue <%s>.\\s*$" % queue, line)
+                    if match:
+                        log.info("Submitted with LSF ID " + match.group(1))
+                        self.bjob_to_task[match.group(1)] = key
+                        self.task_to_bjob[key] = match.group(1)
+                        self.change_state(key, State.QUEUED, match.group(1))
+                        return
+            else:
+                log.error("Validator reported config error in task " + str(key))
 
             log.error("Submission failed.")
             self.fail(key)
@@ -165,6 +170,19 @@ class RemoteLsfExecutor(BaseExecutor):
                 if bjob.running and bjob.lsf_id in self.bjob_to_task:
                     connection.exec_command("source /etc/profile.d/lsf.sh && bkill " + bjob.lsf_id)
                     self.fail(self.bjob_to_task[bjob.lsf_id])
+
+    @staticmethod
+    def _parse_command(command: CommandType):
+        try:
+            valid = command[:3] == ["airflow", "tasks", "run"]
+            subdir = command.index("--subdir") + 1
+            dag = airflow.utils.cli.get_dag(command[subdir], command[3])
+            print(dag.tasks)
+        except ValueError:
+            valid = False
+
+        return collections.namedtuple("LsfData", ["mem", "cores", "name", "command", "valid"])\
+            (mem=1, cores=1, name="Test", command="sleep 20", valid=valid)
 
     @staticmethod
     def _parse_bjob(line: str) -> LsfTask:
