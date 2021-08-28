@@ -1,4 +1,6 @@
 import collections
+import csv
+import json
 import os
 import random
 import re
@@ -8,9 +10,10 @@ from urllib.parse import urlparse
 from datetime import datetime, timezone
 
 import airflow.utils.cli
+from airflow import DAG
 from airflow.configuration import conf, log
 from airflow.executors.base_executor import BaseExecutor, CommandType
-from airflow.models.taskinstance import TaskInstanceKey, TaskInstance
+from airflow.models.taskinstance import TaskInstanceKey
 from paramiko.rsakey import RSAKey
 from paramiko import SSHClient
 
@@ -173,16 +176,55 @@ class RemoteLsfExecutor(BaseExecutor):
 
     @staticmethod
     def _parse_command(command: CommandType):
+        name = ""
+        commands = list()
+        mem = 1
+        cores = 1
+
         try:
             valid = command[:3] == ["airflow", "tasks", "run"]
             subdir = command.index("--subdir") + 1
             dag = airflow.utils.cli.get_dag(command[subdir], command[3])
-            print(dag.tasks)
+
+            mem, cores = RemoteLsfExecutor._scan_performance_database(dag)
+            name = dag.dag_id + "_" + dag.dag_id
+            commands = [task.bash_command for task in dag.tasks]
         except ValueError:
             valid = False
 
         return collections.namedtuple("LsfData", ["mem", "cores", "name", "command", "valid"])\
-            (mem=1, cores=1, name="Test", command="sleep 20", valid=valid)
+            (mem=mem, cores=cores, name=name, command=" && ".join(commands), valid=valid)
+
+    @staticmethod
+    def _scan_performance_database(dag: DAG):
+        try:
+            database = open("performance_db.csv")
+            data = dict()
+            for row in csv.reader(database, delimiter=";"):
+                if row[0] == dag.dag_id:
+                    if row[1] not in data:
+                        data[row[1]] = list()
+                    data[row[1]].append((row[2], row[3]))
+
+            param_dump = json.dumps(dag.params)
+            # Exact match, return specification.
+            if param_dump in data:
+                return data[param_dump][0]
+            # Estimate requirements from average
+            # See https://stackoverflow.com/questions/3223043/how-do-i-sum-the-columns-in-2d-list
+            else:
+                length = len(data)
+                sums = map(sum, zip(*data))
+                return sums[0] / length, sums[1] / length
+        # Unknown command, return default settings
+        except KeyError:
+            log.info("No performance entry found for DAG %s, using default settings.", dag.dag_id)
+            return 1, 1
+        except IOError:
+            log.warn("Performance database not found.")
+            return 1, 1
+        finally:
+            database.close()
 
     @staticmethod
     def _parse_bjob(line: str) -> LsfTask:
