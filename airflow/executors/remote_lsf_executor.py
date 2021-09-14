@@ -183,20 +183,24 @@ class RemoteLsfExecutor(BaseExecutor):
 
         try:
             valid = command[:3] == ["airflow", "tasks", "run"]
-            subdir = command.index("--subdir") + 1
-            dag = airflow.utils.cli.get_dag(command[subdir], command[3])
+            subdir = command[command.index("--subdir") + 1]
+            dag = airflow.utils.cli.get_dag(subdir, command[3])
+            task_name = command[4]
 
             mem, cores = RemoteLsfExecutor._scan_performance_database(dag)
-            name = dag.dag_id + "_" + dag.dag_id
-            commands = [task.bash_command for task in dag.tasks]
+            name = dag.dag_id + "_" + task_name + "_" + str(time.time())
+            command = [task.bash_command for task in dag.tasks if task.task_id == task_name][0]
+            if "INVALID" in command:
+                valid = False
         except ValueError:
             valid = False
 
         return collections.namedtuple("LsfData", ["mem", "cores", "name", "command", "valid"])\
-            (mem=mem, cores=cores, name=name, command=" && ".join(commands), valid=valid)
+            (mem=mem, cores=cores, name=name, command=command, valid=valid)
 
     @staticmethod
     def _scan_performance_database(dag: DAG):
+        database = None
         try:
             database = open("performance_db.csv")
             data = dict()
@@ -224,7 +228,8 @@ class RemoteLsfExecutor(BaseExecutor):
             log.warn("Performance database not found.")
             return 1, 1
         finally:
-            database.close()
+            if database:
+                database.close()
 
     @staticmethod
     def _parse_bjob(line: str) -> LsfTask:
